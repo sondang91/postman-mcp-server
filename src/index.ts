@@ -215,7 +215,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             folderId: {
               type: "string",
-              description: "Optional: Folder ID to organize requests",
+              description: "Optional: Folder ID to organize requests. If provided, request will be created in this folder.",
+            },
+            folderName: {
+              type: "string",
+              description: "Optional: Folder name to organize requests. Will auto-find folderId. Takes precedence over folderId if both provided.",
             },
           },
           required: ["collectionId", "name", "method", "url"],
@@ -353,6 +357,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               type: "string",
               description: "Optional: Folder name to organize requests (will be created if not exists)",
             },
+            folderId: {
+              type: "string",
+              description: "Optional: Folder ID to organize requests. Takes precedence over folderName if both provided.",
+            },
           },
           required: ["collectionId", "controllerCode", "baseUrl"],
         },
@@ -402,11 +410,60 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           body?: { mode: string; raw?: string };
           description?: string;
           folderId?: string;
+          folderName?: string;
         };
 
         // Get collection first to understand structure
         const collection = await postmanRequest("GET", `/collections/${createArgs.collectionId}`);
         const collectionData = collection.collection;
+
+        // Helper function to recursively find folder by ID or name
+        const findFolder = (
+          items: unknown[],
+          targetId?: string,
+          targetName?: string
+        ): { name: string; item: unknown[]; id?: string } | null => {
+          for (const item of items) {
+            const folderItem = item as {
+              id?: string;
+              name?: string;
+              item?: unknown[];
+              request?: unknown;
+            };
+
+            // Check if this is a folder (has "item" array and "name", no "request")
+            if (folderItem.item && Array.isArray(folderItem.item) && folderItem.name && !folderItem.request) {
+              // Match by ID or name
+              if (targetId && folderItem.id === targetId) {
+                return folderItem as { name: string; item: unknown[]; id?: string };
+              }
+              if (targetName && folderItem.name === targetName) {
+                return folderItem as { name: string; item: unknown[]; id?: string };
+              }
+
+              // Recursively search in subfolders
+              const found = findFolder(folderItem.item, targetId, targetName);
+              if (found) return found;
+            }
+          }
+          return null;
+        };
+
+        // Determine target folder ID
+        let targetFolderId: string | undefined = createArgs.folderId;
+        let targetFolderName: string | undefined = createArgs.folderName;
+
+        // If folderName provided but no folderId, find folderId by name
+        if (targetFolderName && !targetFolderId) {
+          const foundFolder = findFolder(collectionData.item || [], undefined, targetFolderName);
+          if (foundFolder && foundFolder.id) {
+            targetFolderId = foundFolder.id;
+          } else {
+            // Folder not found - will create at root with warning
+            targetFolderId = undefined;
+            targetFolderName = undefined;
+          }
+        }
 
         // Build request object
         const requestObj: {
@@ -418,7 +475,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             body?: { mode: string; raw?: string };
             description?: string;
           };
-          folder?: string;
         } = {
           name: createArgs.name,
           request: {
@@ -448,14 +504,70 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           requestObj.request.description = createArgs.description;
         }
 
-        // Add to folder if specified
-        if (createArgs.folderId) {
-          requestObj.folder = createArgs.folderId;
+        // Helper function to recursively add request to folder
+        const addRequestToFolder = (
+          items: unknown[],
+          folderId: string,
+          request: typeof requestObj
+        ): boolean => {
+          for (const item of items) {
+            const folderItem = item as {
+              id?: string;
+              name?: string;
+              item?: unknown[];
+              request?: unknown;
+            };
+
+            // Check if this is the target folder
+            if (folderItem.id === folderId && folderItem.item && Array.isArray(folderItem.item)) {
+              folderItem.item.push(request);
+              return true;
+            }
+
+            // Recursively search in subfolders
+            if (folderItem.item && Array.isArray(folderItem.item)) {
+              if (addRequestToFolder(folderItem.item, folderId, request)) {
+                return true;
+              }
+            }
+          }
+          return false;
+        };
+
+        // Add request to folder or collection root
+        let addedToFolder = false;
+        if (targetFolderId) {
+          addedToFolder = addRequestToFolder(collectionData.item || [], targetFolderId, requestObj);
         }
 
-        // Update collection with new request
-        collectionData.item = collectionData.item || [];
-        collectionData.item.push(requestObj);
+        // If not added to folder (folder not found or no folderId), add to collection root
+        if (!addedToFolder) {
+          collectionData.item = collectionData.item || [];
+          collectionData.item.push(requestObj);
+        }
+
+        // Fix collection variables before update
+        if (collectionData.variable && Array.isArray(collectionData.variable)) {
+          const validTypes = ["string", "any", "secret", "boolean", "number"];
+          collectionData.variable = collectionData.variable.map(
+            (v: { type?: string; key?: string; value?: string; [key: string]: unknown }) => {
+              const fixedVar: { key?: string; value?: string; type: string; [key: string]: unknown } = {
+                key: v.key,
+                value: v.value,
+                type: "string",
+              };
+              Object.keys(v).forEach((key) => {
+                if (key !== "type" && key !== "key" && key !== "value") {
+                  fixedVar[key] = v[key];
+                }
+              });
+              if (v.type && typeof v.type === "string" && validTypes.includes(v.type)) {
+                fixedVar.type = v.type;
+              }
+              return fixedVar;
+            }
+          );
+        }
 
         // Update collection via PUT
         const updated = await postmanRequest(
@@ -464,6 +576,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           { collection: collectionData }
         );
 
+        const locationMessage = addedToFolder
+          ? `in folder '${targetFolderName || targetFolderId}'`
+          : "at collection root";
+
         return {
           content: [
             {
@@ -471,7 +587,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               text: JSON.stringify(
                 {
                   success: true,
-                  message: `Request '${createArgs.name}' created successfully`,
+                  message: `Request '${createArgs.name}' created successfully ${locationMessage}`,
+                  folderId: targetFolderId,
+                  folderName: targetFolderName,
                   collection: updated,
                 },
                 null,
@@ -806,6 +924,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           baseUrl: string;
           apiVersion?: string;
           folderName?: string;
+          folderId?: string;
         };
 
         // Parse controller code to extract endpoints using enhanced parser
@@ -854,13 +973,48 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           collectionData.item = [];
         }
 
-        // Find or create folder if folderName is provided
-        let targetFolder: { name: string; item: unknown[] } | null = null;
-        if (syncArgs.folderName) {
-          targetFolder = collectionData.item.find(
-            (item: { name?: string; item?: unknown[] }) =>
-              item.name === syncArgs.folderName && Array.isArray(item.item)
-          ) as { name: string; item: unknown[] } | null;
+        // Helper function to recursively find folder by ID or name
+        const findFolderByIdOrName = (
+          items: unknown[],
+          targetId?: string,
+          targetName?: string
+        ): { name: string; item: unknown[]; id?: string } | null => {
+          for (const item of items) {
+            const folderItem = item as {
+              id?: string;
+              name?: string;
+              item?: unknown[];
+              request?: unknown;
+            };
+
+            // Check if this is a folder (has "item" array and "name", no "request")
+            if (folderItem.item && Array.isArray(folderItem.item) && folderItem.name && !folderItem.request) {
+              // Match by ID or name
+              if (targetId && folderItem.id === targetId) {
+                return folderItem as { name: string; item: unknown[]; id?: string };
+              }
+              if (targetName && folderItem.name === targetName) {
+                return folderItem as { name: string; item: unknown[]; id?: string };
+              }
+
+              // Recursively search in subfolders
+              const found = findFolderByIdOrName(folderItem.item, targetId, targetName);
+              if (found) return found;
+            }
+          }
+          return null;
+        };
+
+        // Find or create folder if folderId or folderName is provided
+        // folderId takes precedence over folderName
+        let targetFolder: { name: string; item: unknown[]; id?: string } | null = null;
+        
+        if (syncArgs.folderId) {
+          // Find by folderId
+          targetFolder = findFolderByIdOrName(collectionData.item || [], syncArgs.folderId, undefined);
+        } else if (syncArgs.folderName) {
+          // Find by folderName
+          targetFolder = findFolderByIdOrName(collectionData.item || [], undefined, syncArgs.folderName);
 
           // Create folder if it doesn't exist
           if (!targetFolder) {
@@ -868,6 +1022,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               name: syncArgs.folderName,
               item: [],
             };
+            collectionData.item = collectionData.item || [];
             collectionData.item.unshift(targetFolder);
           }
         }
