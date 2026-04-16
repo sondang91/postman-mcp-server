@@ -53,6 +53,77 @@ const server = new Server({
         tools: {},
     },
 });
+/**
+ * Recursively sanitize collection items to fix Postman API schema violations.
+ *
+ * Postman v2.1.0 schema requires every item to be EITHER:
+ *   - a **request** (has `request` property), OR
+ *   - a **folder** (has `item` array property)
+ *
+ * Common violations in saved collections:
+ *   1. Items with `response` array but missing `request` → add stub request
+ *   2. Response headers with non-string `value` → convert to string
+ *   3. Response headers that are neither string nor {key,value} object → remove
+ */
+function sanitizeCollectionItems(items) {
+    for (let i = items.length - 1; i >= 0; i--) {
+        const item = items[i];
+        // Recursively sanitize sub-items (folders)
+        if (item.item && Array.isArray(item.item)) {
+            sanitizeCollectionItems(item.item);
+        }
+        // Fix: item has `response` but no `request` → structurally invalid
+        // This happens when Postman exports saved responses on items that lost their request
+        if (item.response && Array.isArray(item.response) && !item.request) {
+            if (item.item && Array.isArray(item.item)) {
+                // It's a folder with stray responses — just remove the responses
+                delete item.response;
+            }
+            else {
+                // Orphan item: has response but no request and no sub-items
+                // Add a minimal stub request so Postman schema accepts it
+                item.request = {
+                    method: "GET",
+                    url: { raw: "{{baseUrl}}/placeholder", host: ["{{baseUrl}}"], path: ["placeholder"] },
+                    description: "Auto-generated stub — original request was missing from collection data.",
+                };
+            }
+        }
+        // Fix response headers: ensure all header values are strings
+        if (item.response && Array.isArray(item.response)) {
+            for (const resp of item.response) {
+                const response = resp;
+                if (response.header && Array.isArray(response.header)) {
+                    response.header = response.header
+                        .filter((h) => h !== null && typeof h === "object" && !Array.isArray(h))
+                        .map((h) => {
+                        const header = h;
+                        return {
+                            ...header,
+                            key: String(header.key ?? ""),
+                            value: String(header.value ?? ""),
+                        };
+                    });
+                }
+            }
+        }
+    }
+}
+/**
+ * Strip Postman owner prefix from UID.
+ * Postman UIDs have format "{ownerId}-{uuid}" (e.g. "51464854-b9e4288d-321e-43f7-a902-cfbad88e7726").
+ * Collection GET returns bare UUIDs without owner prefix.
+ * This function extracts the bare UUID so both formats can be compared.
+ */
+function stripOwnerPrefix(uid) {
+    // Postman UUID is always 36 chars (8-4-4-4-12). If input is longer, strip the prefix.
+    // Owner prefix format: "{ownerId}-" where ownerId is numeric (e.g. "51464854-")
+    const match = uid.match(/^(\d+)-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i);
+    if (match) {
+        return match[2]; // Return bare UUID
+    }
+    return uid; // Already bare UUID
+}
 // Get Postman API Key from environment
 function getPostmanApiKey() {
     const apiKey = process.env.POSTMAN_API_KEY;
@@ -369,7 +440,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                         // Check if this is a folder (has "item" array and "name", no "request")
                         if (folderItem.item && Array.isArray(folderItem.item) && folderItem.name && !folderItem.request) {
                             // Match by ID or name
-                            if (targetId && folderItem.id === targetId) {
+                            if (targetId && folderItem.id === stripOwnerPrefix(targetId)) {
                                 return folderItem;
                             }
                             if (targetName && folderItem.name === targetName) {
@@ -383,8 +454,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                     }
                     return null;
                 };
-                // Determine target folder ID
-                let targetFolderId = createArgs.folderId;
+                // Determine target folder ID — strip owner prefix for matching
+                let targetFolderId = createArgs.folderId ? stripOwnerPrefix(createArgs.folderId) : undefined;
                 let targetFolderName = createArgs.folderName;
                 // If folderName provided but no folderId, find folderId by name
                 if (targetFolderName && !targetFolderId) {
@@ -471,6 +542,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                         }
                         return fixedVar;
                     });
+                }
+                // Sanitize all items to fix pre-existing schema violations
+                if (collectionData.item && Array.isArray(collectionData.item)) {
+                    sanitizeCollectionItems(collectionData.item);
                 }
                 // Update collection via PUT
                 const updated = await postmanRequest("PUT", `/collections/${createArgs.collectionId}`, { collection: collectionData });
@@ -568,6 +643,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                         }
                         return fixedVar;
                     });
+                }
+                // Sanitize all items to fix pre-existing schema violations
+                if (collectionData.item && Array.isArray(collectionData.item)) {
+                    sanitizeCollectionItems(collectionData.item);
                 }
                 // Update collection
                 const updated = await postmanRequest("PUT", `/collections/${deleteArgs.collectionId}`, {
@@ -691,6 +770,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 }
                 // Add folder to collection (at the beginning to make it easy to find)
                 collectionData.item.unshift(folderItem);
+                // Sanitize all items to fix pre-existing schema violations
+                sanitizeCollectionItems(collectionData.item);
                 // Update collection - send the entire collection object
                 // Postman API expects: { collection: { ... } }
                 const updated = await postmanRequest("PUT", `/collections/${collectionId}`, {
@@ -757,7 +838,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                         // Check if this is a folder (has "item" array and "name", no "request")
                         if (folderItem.item && Array.isArray(folderItem.item) && folderItem.name && !folderItem.request) {
                             // Match by ID or name
-                            if (targetId && folderItem.id === targetId) {
+                            if (targetId && folderItem.id === stripOwnerPrefix(targetId)) {
                                 return folderItem;
                             }
                             if (targetName && folderItem.name === targetName) {
@@ -775,8 +856,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 // folderId takes precedence over folderName
                 let targetFolder = null;
                 if (syncArgs.folderId) {
-                    // Find by folderId
-                    targetFolder = findFolderByIdOrName(collectionData.item || [], syncArgs.folderId, undefined);
+                    // Find by folderId (strip owner prefix for matching)
+                    targetFolder = findFolderByIdOrName(collectionData.item || [], stripOwnerPrefix(syncArgs.folderId), undefined);
                 }
                 else if (syncArgs.folderName) {
                     // Find by folderName
@@ -925,6 +1006,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                             error: error instanceof Error ? error.message : String(error),
                         });
                     }
+                }
+                // Sanitize all items to fix pre-existing schema violations
+                if (collectionData.item && Array.isArray(collectionData.item)) {
+                    sanitizeCollectionItems(collectionData.item);
                 }
                 // Update collection with all new requests
                 if (results.some((r) => r.status === "created")) {
